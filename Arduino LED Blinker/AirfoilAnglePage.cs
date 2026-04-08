@@ -23,34 +23,29 @@ namespace UnoLedControl
         private Button btnSet;
         private Button btnStop;
         private Button btnHome;
+        private Button btnSetHome;
 
         private Label vActual;
         private Label vTarget;
         private Label vError;
-
-        // Optional debug (helps prove it’s sending)
         private Label vCmd;
 
         // State
         private double _targetDeg = 0.0;
         private bool _pendingSend;
+        private bool _startupSynced = false;
 
         // Cache (prevents blinking)
         private readonly Dictionary<Label, string> _last = new Dictionary<Label, string>();
 
-        // Adjust these to your real range
         private const int MinAngleDeg = -180;
         private const int MaxAngleDeg = 180;
 
-        // ====== STEPPER MAPPING (TUNE THIS) ======
-        // If MS1/MS2/MS3 are tied LOW (full-step): 200 steps/rev => 200/360 = 0.5556 steps/deg (direct 1:1)
-        // If 1/16 microstep: 3200/360 = 8.8889 steps/deg (direct 1:1)
+        // Tune this to your mechanics
         private const double StepsPerDegree = 0.556;
 
-        // Speed sent to Arduino (steps per second)
         private const int DefaultSps = 800;
 
-        // Track last commanded step target to avoid “0 step” sends
         private long _lastSentTargetSteps = long.MinValue;
 
         public AirfoilAnglePage(SerialPort serial, TelemetryStore telemetry, Action<string> logTx)
@@ -73,7 +68,6 @@ namespace UnoLedControl
             _timer.Tick += (s, e) => RefreshValues();
             _timer.Start();
 
-            // Debounce sends from slider/nud (prevents spamming serial)
             _sendDebounce.Interval = 150;
             _sendDebounce.Tick += (s, e) =>
             {
@@ -184,7 +178,11 @@ namespace UnoLedControl
                 Margin = new Padding(0, 18, 0, 18)
             };
             StyleButton(btnStop);
-            btnStop.Click += (s, e) => Send("STEPPER STOP");
+            btnStop.Click += (s, e) =>
+            {
+                Send("STEPPER STOP");
+                SetIfChanged(vCmd, "STEPPER STOP");
+            };
             header.Controls.Add(btnStop, 2, 0);
 
             var scroll = new Panel
@@ -220,7 +218,7 @@ namespace UnoLedControl
             controlGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 140));
             controlGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 80));
             controlGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 520));
-            controlGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 220));
+            controlGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 320));
             body.Controls.Add(controlGrid);
 
             controlGrid.RowCount = 1;
@@ -288,16 +286,28 @@ namespace UnoLedControl
             StyleButton(btnHome);
             btnHome.Click += (s, e) =>
             {
-                // Hard command to go to 0 steps, not just UI update
                 _targetDeg = 0.0;
-                _lastSentTargetSteps = long.MinValue; // force send even if rounding
+                _lastSentTargetSteps = long.MinValue;
                 Send("STEPPER GOTO 0 " + DefaultSps);
-                _logTx?.Invoke("STEPPER GOTO 0 " + DefaultSps);
-
-                // sync UI
+                SetIfChanged(vCmd, "STEPPER GOTO 0 " + DefaultSps);
                 SetTarget(0.0, sendNow: false);
             };
             btnGrid.Controls.Add(btnHome);
+
+            btnSetHome = new Button { Text = "SET HOME", Size = new Size(110, 36) };
+            StyleButton(btnSetHome);
+            btnSetHome.Click += (s, e) =>
+            {
+                Send("ENCODER ZERO");
+                SetIfChanged(vCmd, "ENCODER ZERO");
+
+                // Wait for fresh telemetry from Arduino after zeroing
+                _startupSynced = false;
+                _targetDeg = 0.0;
+                _lastSentTargetSteps = 0;
+                SetTarget(0.0, sendNow: false);
+            };
+            btnGrid.Controls.Add(btnSetHome);
 
             body.Controls.Add(MakeSectionHeader("Live feedback"));
 
@@ -316,8 +326,6 @@ namespace UnoLedControl
             vActual = AddRow(live, "AS5600 actual angle (deg)", "--", chip: true);
             vTarget = AddRow(live, "Target angle (deg)", "--", chip: true);
             vError = AddRow(live, "Error (Target - Actual)", "--", chip: true);
-
-            // Debug row so you can SEE what command is being sent
             vCmd = AddRow(live, "Last stepper cmd", "--", chip: false);
 
             _last.Clear();
@@ -325,8 +333,6 @@ namespace UnoLedControl
             _last[vTarget] = null;
             _last[vError] = null;
             _last[vCmd] = null;
-
-            SetTarget(0.0, sendNow: false);
         }
 
         private Control MakeSectionHeader(string text)
@@ -418,7 +424,6 @@ namespace UnoLedControl
         {
             long targetSteps = DegreesToSteps(deg);
 
-            // If we're already at this target, don't resend (prevents tiny wiggle)
             if (targetSteps == _lastSentTargetSteps)
                 return;
 
@@ -426,6 +431,7 @@ namespace UnoLedControl
 
             string cmd = $"STEPPER GOTO {targetSteps} {sps}";
             Send(cmd);
+            SetIfChanged(vCmd, cmd);
         }
 
         private void Send(string cmd)
@@ -453,15 +459,35 @@ namespace UnoLedControl
         {
             string asStr = _telemetry.Get("as5600", "--");
             SetIfChanged(vActual, asStr);
-            SetIfChanged(vTarget, _targetDeg.ToString("0.0", CultureInfo.InvariantCulture));
 
             if (TryParseDouble(asStr, out var actual))
             {
+                // First valid angle after startup: sync UI to real physical position
+                if (!_startupSynced)
+                {
+                    _startupSynced = true;
+                    _targetDeg = actual;
+
+                    int tbVal = (int)Math.Round(actual * 10.0);
+                    tbVal = Math.Max(tbAngle.Minimum, Math.Min(tbAngle.Maximum, tbVal));
+                    if (tbAngle.Value != tbVal)
+                        tbAngle.Value = tbVal;
+
+                    decimal nudVal = (decimal)Math.Max(MinAngleDeg, Math.Min(MaxAngleDeg, actual));
+                    if (nudAngle.Value != nudVal)
+                        nudAngle.Value = nudVal;
+
+                    _lastSentTargetSteps = DegreesToSteps(actual);
+                }
+
+                SetIfChanged(vTarget, _targetDeg.ToString("0.0", CultureInfo.InvariantCulture));
+
                 double err = _targetDeg - actual;
                 SetIfChanged(vError, err.ToString("0.0", CultureInfo.InvariantCulture));
             }
             else
             {
+                SetIfChanged(vTarget, _targetDeg.ToString("0.0", CultureInfo.InvariantCulture));
                 SetIfChanged(vError, "--");
             }
         }
